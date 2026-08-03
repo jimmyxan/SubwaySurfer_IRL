@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# Environments
+.venv/
+env/
+venv/
+
+# Testing & Coverage
+.coverage
+.pytest_cache/
+
+# macOS system files
+.DS_Store
+
+# Temporary files
+tempCodeRunnerFile.py
