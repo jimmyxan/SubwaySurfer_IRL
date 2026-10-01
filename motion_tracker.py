@@ -2,7 +2,7 @@ import cv2
 import mediapipe as mp
 import time
 import numpy as np
-import ssl
+import threading
 import subprocess
 import sys
 import os
@@ -11,6 +11,8 @@ import webbrowser
 import ui_renderer
 from ui_renderer import PoseLandmark
 from input_simulator import InputSimulator
+from motion_logic import (MotionDetector, ClapDetector, JUMP_THRESHOLD, CROUCH_THRESHOLD,
+                          LATERAL_THRESHOLD)
 
 try:
     import mediapipe.python.solutions.pose as mp_pose
@@ -27,17 +29,18 @@ except Exception:
             mp_pose = None
             mp_drawing = None
 
-# --- CONFIGURAZIONE SOGLIE E DEBOUNCE ---
-# Le coordinate di MediaPipe sono normalizzate tra 0.0 e 1.0 rispetto alla risoluzione del frame.
-# L'asse Y cresce verso il basso (0 in alto, 1 in basso).
-# L'asse X cresce verso destra (0 a sinistra, 1 a destra).
+# --- CONFIGURAZIONE ---
+# Le soglie di movimento (salto, capriola, laterale, isteresi, conferma) sono in motion_logic.py.
 
-JUMP_THRESHOLD = 0.07     # Spostamento verso l'alto (diminuzione di Y delle spalle)
-CROUCH_THRESHOLD = 0.12   # Spostamento verso il basso (aumento di Y delle spalle, aumentato per evitare falsi positivi pre-salto)
-LATERAL_THRESHOLD = 0.10  # Spostamento laterale (X del busto rispetto alla calibrazione)
+CALIBRATION_FRAMES = 45   # Frame per calcolare la posizione di riposo (~1.5 s a 30 fps)
+COUNTDOWN_SECONDS = 2.0   # Conto alla rovescia prima della calibrazione
 
-MIN_STATE_FRAMES = 6      # Numero minimo di frame in cui uno stato deve rimanere attivo (evita sfarfallio)
-CALIBRATION_FRAMES = 120  # Numero di frame per calcolare la posizione di riposo (aumentato a 120 / ~4 secondi)
+MODEL_COMPLEXITY = 0      # 0 = piu' veloce, 1 = piu' preciso (provalo se gli FPS reggono)
+SMOOTH_LANDMARKS = False  # Lo smoothing interno di MediaPipe aggiunge latenza; il filtro e' in MotionDetector
+
+CLAP_DISTANCE_RATIO = 0.45          # Mani "vicine" se piu' vicine di questa frazione della distanza spalle
+HOVERBOARD_DISPLAY_SECONDS = 0.8    # Durata del feedback HOVERBOARD (non blocca i movimenti)
+FRAMING_TOLERANCE_FRAMES = 5        # Frame consecutivi di inquadratura errata tollerati prima di azzerare lo stato
 
 # Indice della fotocamera da utilizzare.
 # Su macOS, se hai un iPhone vicino, Continuity Camera potrebbe impostare l'iPhone come indice 0.
@@ -242,6 +245,78 @@ def setup_browser_and_windows():
     return screen_w, screen_h, browser_w, opencv_w, target_x, target_y
 
 
+class LatestFrameReader:
+    """Legge la webcam in un thread dedicato e conserva solo l'ultimo frame (niente buffer di frame vecchi)."""
+
+    def __init__(self, cap):
+        self.cap = cap
+        self._lock = threading.Lock()
+        self._frame = None
+        self._seq = 0
+        self._ok = True
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stopped:
+            ret, frame = self.cap.read()
+            with self._lock:
+                if not ret:
+                    self._ok = False
+                    return
+                self._frame = frame
+                self._seq += 1
+
+    def read(self, last_seq, timeout=1.0):
+        """Attende un frame piu' recente di last_seq. Ritorna (ok, frame, seq)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if not self._ok:
+                    return False, None, last_seq
+                if self._frame is not None and self._seq != last_seq:
+                    return True, self._frame, self._seq
+            time.sleep(0.001)
+        return False, None, last_seq
+
+    def stop(self):
+        self._stopped = True
+        self._thread.join(timeout=1.0)
+
+
+def open_camera():
+    if CAMERA_INDEX is not None:
+        print(f"Tentativo di connessione alla fotocamera con indice fisso: {CAMERA_INDEX}...")
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+    else:
+        print("Rilevamento automatico della webcam... Tentativo con indice 1 (webcam integrata Mac)...")
+        cap = cv2.VideoCapture(1)
+        if not cap.isOpened():
+            print("Indice 1 non disponibile. Fallback su indice 0...")
+            cap.release()
+            cap = cv2.VideoCapture(0)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 60)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+def draw_guides(frame, detector, width, height, scale=1.0):
+    y_base = int(detector.y0 * height)
+    cv2.line(frame, (0, y_base), (width, y_base), (0, 255, 255), 1)
+    cv2.line(frame, (0, int((detector.y0 - JUMP_THRESHOLD * scale) * height)),
+             (width, int((detector.y0 - JUMP_THRESHOLD * scale) * height)), (57, 255, 20), 1, cv2.LINE_4)
+    cv2.line(frame, (0, int((detector.y0 + CROUCH_THRESHOLD * scale) * height)),
+             (width, int((detector.y0 + CROUCH_THRESHOLD * scale) * height)), (0, 242, 254), 1, cv2.LINE_4)
+    for sign in (-1, 1):
+        px = int((detector.x0 + sign * LATERAL_THRESHOLD * scale) * width)
+        cv2.line(frame, (px, 0), (px, height), (255, 255, 0), 1)
+
+
 def main():
     # Inizializzazione MediaPipe Pose
     pose = None
@@ -249,8 +324,8 @@ def main():
         try:
             pose = mp_pose.Pose(
                 static_image_mode=False,
-                model_complexity=0,
-                smooth_landmarks=True,
+                model_complexity=MODEL_COMPLEXITY,
+                smooth_landmarks=SMOOTH_LANDMARKS,
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5
             )
@@ -278,343 +353,213 @@ def main():
         print("   python3 motion_tracker.py\n")
         return
 
-    # Inizializzazione Input Simulator per la tastiera
     simulator = InputSimulator()
+    detector = MotionDetector()
+    clap = ClapDetector()
 
-    # Inizializzazione Webcam con fallback automatico
-    if CAMERA_INDEX is not None:
-        print(f"Tentativo di connessione alla fotocamera con indice fisso: {CAMERA_INDEX}...")
-        cap = cv2.VideoCapture(CAMERA_INDEX)
-    else:
-        print("Rilevamento automatico della webcam... Tentativo con indice 1 (webcam integrata Mac)...")
-        cap = cv2.VideoCapture(1)
-        if not cap.isOpened():
-            print("Indice 1 non disponibile. Fallback su indice 0...")
-            cap.release()
-            cap = cv2.VideoCapture(0)
-
+    cap = open_camera()
     if not cap.isOpened():
         print("Errore: Impossibile accedere a nessuna webcam.")
         return
+    reader = LatestFrameReader(cap)
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 60)
-
-    # Variabili per la calibrazione
+    # Stato di calibrazione
     calibrated = False
-    calibration_y_shoulders = []
-    calibration_x_torso = []
-    calibration_shoulder_dist = []
-    calibration_hips_visibility = []
-    
-    y_calibrated = 0.5
-    x_calibrated = 0.5
-    shoulder_dist_calibrated = 0.15
+    calib_y, calib_x, calib_d, calib_hips = [], [], [], []
     use_hips_detection = False
     countdown_start_time = None
+    game_started = False
+    bad_framing_frames = 0
 
-    # Gestione dello stato e debounce
-    current_state = "CORSA / IDLE"
-    state_frame_count = 0
+    hoverboard_until = 0.0
 
-    # Rilevamento applauso (Hoverboard)
-    hands_were_joined = False
-    hoverboard_frames_left = 0
-
-    # Setup risoluzione e layout dinamico dello schermo (Browser 3/4 + OpenCV 1/4)
     screen_w, screen_h, browser_w, opencv_w, target_x, target_y = setup_browser_and_windows()
 
-    print("Subway Surfers Motion Tracker avviato. Premi 'ESC' nella finestra video per uscire.")
+    print("Subway Surfers Motion Tracker avviato. 'ESC' per uscire, 'R' per ricalibrare.")
 
-    # Configura la finestra dell'anteprima OpenCV nell'ultimo quarto a destra (X = 75% larghezza schermo)
     cv2.namedWindow("Subway Surfers Motion Tracker", cv2.WINDOW_NORMAL)
     cv2.moveWindow("Subway Surfers Motion Tracker", browser_w, 0)
     cv2.resizeWindow("Subway Surfers Motion Tracker", opencv_w, screen_h)
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
+    seq = -1
+    fps = 0.0
+    infer_ms = 0.0
+    last_loop = time.monotonic()
+
+    while True:
+        ok, frame, seq = reader.read(seq)
+        if not ok:
             print("Errore: Impossibile leggere il frame dalla webcam.")
             break
 
-        # 1. Specchia orizzontalmente l'immagine per un controllo intuitivo
+        now = time.monotonic()
+        dt = now - last_loop
+        last_loop = now
+        if dt > 0:
+            fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps else 1.0 / dt
+
         frame = cv2.flip(frame, 1)
         height, width, _ = frame.shape
 
-        # Converti il frame in RGB per MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        t0 = time.monotonic()
         results = pose.process(rgb_frame)
-
-        raw_state = "CORSA / IDLE"
+        infer_ms = 0.9 * infer_ms + 0.1 * (time.monotonic() - t0) * 1000.0
 
         if results.pose_landmarks:
-            # Estrazione dei landmarks
             landmarks = results.pose_landmarks.landmark
-            
-            # Punti di interesse: spalla sinistra (11) e spalla destra (12)
+
             left_shoulder = landmarks[PoseLandmark.LEFT_SHOULDER]
             right_shoulder = landmarks[PoseLandmark.RIGHT_SHOULDER]
             left_hip = landmarks[PoseLandmark.LEFT_HIP]
             right_hip = landmarks[PoseLandmark.RIGHT_HIP]
 
-            # Calcolo dei valori correnti
-            # Coordinata Y media delle spalle
             y_shoulders = (left_shoulder.y + right_shoulder.y) / 2
-            # Coordinata X media del busto (midpoint delle spalle)
             x_torso = (left_shoulder.x + right_shoulder.x) / 2
-            # Distanza attuale tra le spalle (usata per calcolare lo scaling)
-            shoulder_dist = np.linalg.norm(np.array([left_shoulder.x - right_shoulder.x, left_shoulder.y - right_shoulder.y]))
+            shoulder_dist = float(np.linalg.norm([left_shoulder.x - right_shoulder.x,
+                                                  left_shoulder.y - right_shoulder.y]))
 
-            # Coordinate pixel per il disegno
             ls_px = (int(left_shoulder.x * width), int(left_shoulder.y * height))
             rs_px = (int(right_shoulder.x * width), int(right_shoulder.y * height))
             torso_px = (int(x_torso * width), int(y_shoulders * height))
 
-            # Disegna lo scheletro standard di MediaPipe
             if mp_drawing is not None and mp_pose is not None:
                 mp_drawing.draw_landmarks(
-                    frame, 
-                    results.pose_landmarks, 
+                    frame,
+                    results.pose_landmarks,
                     mp_pose.POSE_CONNECTIONS,
-                    mp_drawing.DrawingSpec(color=(245,117,66), thickness=2, circle_radius=2),
-                    mp_drawing.DrawingSpec(color=(245,66,230), thickness=2, circle_radius=2)
+                    mp_drawing.DrawingSpec(color=(245, 117, 66), thickness=2, circle_radius=2),
+                    mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=2)
                 )
+            cv2.circle(frame, ls_px, 8, (0, 255, 255), -1)
+            cv2.circle(frame, rs_px, 8, (0, 255, 255), -1)
+            cv2.circle(frame, torso_px, 10, (0, 0, 255), -1)
 
-            # Evidenzia i punti chiave con cerchi personalizzati
-            cv2.circle(frame, ls_px, 8, (0, 255, 255), -1)   # Spalla sinistra (Giallo)
-            cv2.circle(frame, rs_px, 8, (0, 255, 255), -1)   # Spalla destra (Giallo)
-            cv2.circle(frame, torso_px, 10, (0, 0, 255), -1) # Centro Busto (Rosso)
-
-            # --- LOGICA DI CALIBRAZIONE ---
+            # --- CALIBRAZIONE ---
             if not calibrated:
-                # Verifica inquadratura base (spalle e clipping) prima di procedere con la calibrazione
                 is_framed_calib, warning_calib = ui_renderer.check_framing(landmarks, use_hips=False)
-                
+
                 if is_framed_calib:
                     if countdown_start_time is None:
-                        countdown_start_time = time.time()
-                        
-                    elapsed_countdown = time.time() - countdown_start_time
-                    
-                    if elapsed_countdown < 3.0:
-                        # Fase di conto alla rovescia
-                        seconds_left = int(3.0 - elapsed_countdown) + 1
-                        ui_renderer.draw_countdown_popup(frame, seconds_left)
+                        countdown_start_time = now
+                    elapsed_countdown = now - countdown_start_time
+
+                    if elapsed_countdown < COUNTDOWN_SECONDS:
+                        ui_renderer.draw_countdown_popup(frame, int(COUNTDOWN_SECONDS - elapsed_countdown) + 1)
                     else:
-                        # Calibrazione vera e propria
-                        calibration_y_shoulders.append(y_shoulders)
-                        calibration_x_torso.append(x_torso)
-                        calibration_shoulder_dist.append(shoulder_dist)
-                        calibration_hips_visibility.append((left_hip.visibility + right_hip.visibility) / 2)
-                        
-                        progress = int((len(calibration_y_shoulders) / CALIBRATION_FRAMES) * 100)
+                        calib_y.append(y_shoulders)
+                        calib_x.append(x_torso)
+                        calib_d.append(shoulder_dist)
+                        calib_hips.append((left_hip.visibility + right_hip.visibility) / 2)
+
+                        progress = int((len(calib_y) / CALIBRATION_FRAMES) * 100)
                         ui_renderer.draw_calibration_popup(frame, progress)
-                        
-                        if len(calibration_y_shoulders) >= CALIBRATION_FRAMES:
-                            y_calibrated = np.mean(calibration_y_shoulders)
-                            x_calibrated = np.mean(calibration_x_torso)
-                            shoulder_dist_calibrated = np.mean(calibration_shoulder_dist)
-                            
-                            # Decide se richiedere i fianchi nel gameplay
-                            mean_hips_vis = np.mean(calibration_hips_visibility)
-                            use_hips_detection = mean_hips_vis > 0.5
-                            
+
+                        if len(calib_y) >= CALIBRATION_FRAMES:
+                            # Mediana: robusta ai frame rumorosi
+                            detector.calibrate(float(np.median(calib_y)), float(np.median(calib_x)),
+                                               float(np.median(calib_d)))
+                            simulator.corsia_attuale = "CENTRO"
+                            use_hips_detection = float(np.mean(calib_hips)) > 0.5
                             calibrated = True
-                            print(f"Calibrazione completata!")
-                            print(f" - Y spalle base: {y_calibrated:.3f}")
-                            print(f" - X busto base: {x_calibrated:.3f}")
-                            print(f" - Distanza spalle base: {shoulder_dist_calibrated:.3f}")
-                            print(f" - Controllo fianchi attivo: {use_hips_detection} (Visibilita' media: {mean_hips_vis:.2f})")
-                            
-                            # Esegui il click di avvio al centro del browser SOLO dopo il completamento della calibrazione
-                            if AUTO_LAUNCH_GAME:
+                            bad_framing_frames = 0
+                            print("Calibrazione completata!")
+                            print(f" - Y spalle base: {detector.y0:.3f}")
+                            print(f" - X busto base: {detector.x0:.3f}")
+                            print(f" - Distanza spalle base: {detector.d0:.3f}")
+                            print(f" - Controllo fianchi attivo: {use_hips_detection}")
+
+                            if AUTO_LAUNCH_GAME and not game_started:
+                                game_started = True
                                 print("[TRACKER] Calibrazione ultimata! Invio click di avvio sul tasto START...")
                                 pyautogui.click(target_x, target_y)
                                 pyautogui.click(target_x, target_y)
                                 time.sleep(1.5)
                                 pyautogui.click(target_x, target_y)
-
-
                 else:
-                    # Se l'inquadratura non e' idonea, sospendi la calibrazione, resetta il timer e mostra l'errore
                     countdown_start_time = None
-                    progress = int((len(calibration_y_shoulders) / CALIBRATION_FRAMES) * 100)
+                    progress = int((len(calib_y) / CALIBRATION_FRAMES) * 100)
                     ui_renderer.draw_calibration_popup(frame, progress, warning=warning_calib)
-            
-            # --- LOGICA DI RILEVAMENTO DEI MOVIMENTI ---
+
+            # --- RILEVAMENTO MOVIMENTI ---
             else:
-                # Controlla l'inquadratura corrente
                 is_framed, warning_msg = ui_renderer.check_framing(landmarks, use_hips=use_hips_detection)
-                
+
                 if not is_framed:
-                    # Forza lo stato IDLE e mostra l'avviso
-                    raw_state = "CORSA / IDLE"
-                    current_state = "CORSA / IDLE"
-                    state_frame_count = 0
-                    ui_renderer.draw_hud(frame, current_state)
+                    # Tolleranza: un frame sporadico fuori inquadratura (es. durante un salto) non resetta nulla
+                    bad_framing_frames += 1
+                    if bad_framing_frames > FRAMING_TOLERANCE_FRAMES:
+                        detector.release_vertical()
+                    ui_renderer.draw_hud(frame, detector.display_state)
                     ui_renderer.draw_warning_overlay(frame, f"INQUADRATURA COMPROMESSA: {warning_msg}")
                 else:
-                    # Rilevamento Gesto Applauso (HOVERBOARD) - multi-keypoint per massima precisione e sensibilita'
-                    left_wrist = landmarks[PoseLandmark.LEFT_WRIST]
-                    right_wrist = landmarks[PoseLandmark.RIGHT_WRIST]
-                    left_index = landmarks[PoseLandmark.LEFT_INDEX]
-                    right_index = landmarks[PoseLandmark.RIGHT_INDEX]
-                    left_pinky = landmarks[PoseLandmark.LEFT_PINKY]
-                    right_pinky = landmarks[PoseLandmark.RIGHT_PINKY]
-                    left_thumb = landmarks[PoseLandmark.LEFT_THUMB]
-                    right_thumb = landmarks[PoseLandmark.RIGHT_THUMB]
-                    
-                    # Definiamo coppie di punti corrispondenti delle mani
+                    bad_framing_frames = 0
+
+                    # Applauso -> HOVERBOARD (non blocca gli altri movimenti)
                     hand_pairs = [
-                        (left_wrist, right_wrist),
-                        (left_index, right_index),
-                        (left_pinky, right_pinky),
-                        (left_thumb, right_thumb)
+                        (PoseLandmark.LEFT_WRIST, PoseLandmark.RIGHT_WRIST),
+                        (PoseLandmark.LEFT_INDEX, PoseLandmark.RIGHT_INDEX),
+                        (PoseLandmark.LEFT_PINKY, PoseLandmark.RIGHT_PINKY),
+                        (PoseLandmark.LEFT_THUMB, PoseLandmark.RIGHT_THUMB),
                     ]
-                    
-                    distances = []
-                    valid_pairs = []
-                    
-                    for l_pt, r_pt in hand_pairs:
+                    max_hand_dist = CLAP_DISTANCE_RATIO * detector.d0
+                    valid = 0
+                    close = 0
+                    for l_idx, r_idx in hand_pairs:
+                        l_pt, r_pt = landmarks[l_idx], landmarks[r_idx]
                         if l_pt.visibility > 0.5 and r_pt.visibility > 0.5:
-                            dist = np.linalg.norm(np.array([l_pt.x - r_pt.x, l_pt.y - r_pt.y]))
-                            distances.append(dist)
-                            valid_pairs.append((l_pt, r_pt))
-                    
-                    if distances:
-                        # Troviamo la distanza minima tra tutti i keypoint delle mani per maggiore sensibilita'
-                        min_dist = min(distances)
-                        min_idx = np.argmin(distances)
-                        closest_l, closest_r = valid_pairs[min_idx]
-                        
-                        # Soglia per mani vicine aumentata a 0.45 * distanza spalle per facilitare il rilevamento senza falsi positivi
-                        max_hand_dist = 0.45 * shoulder_dist_calibrated
-                        hands_joined = min_dist < max_hand_dist
-                        
-                        # Visualizzazione dei punti di tracciamento
-                        cv2.circle(frame, (int(left_wrist.x * width), int(left_wrist.y * height)), 6, (255, 0, 255), -1)
-                        cv2.circle(frame, (int(right_wrist.x * width), int(right_wrist.y * height)), 6, (255, 0, 255), -1)
-                        
-                        if hands_joined:
-                            # Centroide delle due mani nel punto piu' vicino
-                            x_hands = (closest_l.x + closest_r.x) / 2
-                            y_hands = (closest_l.y + closest_r.y) / 2
-                            cv2.circle(frame, (int(x_hands * width), int(y_hands * height)), 18, (255, 0, 255), 2)
-                    else:
-                        hands_joined = False
- 
-                    # Rilevamento trigger sul fronte di salita (edge trigger)
-                    if hands_joined and not hands_were_joined:
-                        hoverboard_frames_left = 24  # Circa 0.8 secondi di durata
+                            valid += 1
+                            if np.hypot(l_pt.x - r_pt.x, l_pt.y - r_pt.y) < max_hand_dist:
+                                close += 1
+                    for idx in (PoseLandmark.LEFT_WRIST, PoseLandmark.RIGHT_WRIST):
+                        pt = landmarks[idx]
+                        cv2.circle(frame, (int(pt.x * width), int(pt.y * height)), 6, (255, 0, 255), -1)
+
+                    if clap.update(close, valid):
+                        hoverboard_until = now + HOVERBOARD_DISPLAY_SECONDS
                         print("[TRACKER] GESTO RILEVATO: Applauso! Attivazione HOVERBOARD")
-                        simulator.simulate(current_state, "HOVERBOARD")
-                        
-                    hands_were_joined = hands_joined
- 
-                    # Gestione dello stato prioritario HOVERBOARD o dei movimenti standard
-                    if hoverboard_frames_left > 0:
-                        hoverboard_frames_left -= 1
-                        current_state = "HOVERBOARD"
-                        state_frame_count = 0
-                        ui_renderer.draw_hud(frame, current_state)
+                        simulator.simulate(detector.display_state, "HOVERBOARD")
+
+                    prev_lane = detector.lane
+                    events = detector.update(y_shoulders, x_torso, shoulder_dist, now)
+                    for event in events:
+                        print(f"[TRACKER] Evento: {event}")
+                        simulator.simulate(prev_lane, event)
+
+                    draw_guides(frame, detector, width, height,
+                                min(max(shoulder_dist / detector.d0, 0.5), 2.0))
+
+                    if now < hoverboard_until and detector.is_idle:
+                        ui_renderer.draw_hud(frame, "HOVERBOARD")
                     else:
-                        # Calcolo dei limiti di tolleranza scalati dinamicamente rispetto alla distanza spalle
-                        scale = shoulder_dist / shoulder_dist_calibrated
-                        dynamic_jump_threshold = JUMP_THRESHOLD * scale
-                        dynamic_crouch_threshold = CROUCH_THRESHOLD * scale
-                        dynamic_lateral_threshold = LATERAL_THRESHOLD * scale
- 
-                        # Disegna linee guida di riferimento (HUD hi-tech a schermo)
-                        y_base_px = int(y_calibrated * height)
-                        x_left_px = int((x_calibrated - dynamic_lateral_threshold) * width)
-                        x_right_px = int((x_calibrated + dynamic_lateral_threshold) * width)
- 
-                        # Linea orizzontale altezza spalle (Calibrata)
-                        cv2.line(frame, (0, y_base_px), (width, y_base_px), (0, 255, 255), 1)
-                        
-                        # Linee di salto/capriola per feedback visivo
-                        y_jump_px = int((y_calibrated - dynamic_jump_threshold) * height)
-                        y_crouch_px = int((y_calibrated + dynamic_crouch_threshold) * height)
-                        cv2.line(frame, (0, y_jump_px), (width, y_jump_px), (57, 255, 20), 1, cv2.LINE_4)
-                        cv2.line(frame, (0, y_crouch_px), (width, y_crouch_px), (0, 242, 254), 1, cv2.LINE_4)
- 
-                        # Linee verticali per i limiti laterali
-                        cv2.line(frame, (x_left_px, 0), (x_left_px, height), (255, 255, 0), 1)
-                        cv2.line(frame, (x_right_px, 0), (x_right_px, height), (255, 255, 0), 1)
- 
-                        # Controllo Altezza (Salto / Capriola) rispetto alla calibrazione
-                        if y_shoulders < y_calibrated - dynamic_jump_threshold:
-                            raw_state = "SALTO"
-                        elif y_shoulders > y_calibrated + dynamic_crouch_threshold:
-                            raw_state = "CAPRIOLA"
-                        
-                        # Controllo Laterale (Sinistra / Destra)
-                        else:
-                            if x_torso < x_calibrated - dynamic_lateral_threshold:
-                                raw_state = "SPOSTAMENTO SINISTRA"
-                            elif x_torso > x_calibrated + dynamic_lateral_threshold:
-                                raw_state = "SPOSTAMENTO DESTRA"
-                            else:
-                                # Se l'utente era a sinistra o a destra, il ritorno al centro viene
-                                # identificato come uno stato di transizione "SPOSTAMENTO CENTRO"
-                                if current_state in ["SPOSTAMENTO SINISTRA", "SPOSTAMENTO DESTRA"]:
-                                    raw_state = "SPOSTAMENTO CENTRO"
-                                else:
-                                    raw_state = "CORSA / IDLE"
- 
-                        # Se veniamo dallo stato HOVERBOARD, ripristiniamo immediatamente lo stato reale senza attendere il debounce
-                        if current_state == "HOVERBOARD":
-                            print(f"[TRACKER] Cambio Stato: HOVERBOARD -> {raw_state}")
-                            simulator.simulate(current_state, raw_state)
-                            current_state = raw_state
-                            state_frame_count = 0
-                        else:
-                            # Debounce normale
-                            if raw_state != current_state:
-                                if state_frame_count >= MIN_STATE_FRAMES:
-                                    print(f"[TRACKER] Cambio Stato: {current_state} -> {raw_state}")
-                                    simulator.simulate(current_state, raw_state)
-                                    current_state = raw_state
-                                    state_frame_count = 0
-                                else:
-                                    state_frame_count += 1
-                            else:
-                                state_frame_count += 1
- 
-                        # Aggiornamento dinamico (EMA) dei parametri di calibrazione (attivo solo in CORSA / IDLE stabile)
-                        if current_state == "CORSA / IDLE":
-                            alpha = 0.005
-                            y_calibrated = alpha * y_shoulders + (1.0 - alpha) * y_calibrated
-                            x_calibrated = alpha * x_torso + (1.0 - alpha) * x_calibrated
-                            shoulder_dist_calibrated = alpha * shoulder_dist + (1.0 - alpha) * shoulder_dist_calibrated
- 
-                        # Disegna l'HUD con lo stato corrente calibrato
-                        ui_renderer.draw_hud(frame, current_state)
+                        ui_renderer.draw_hud(frame, detector.display_state)
         else:
-            # Se la posa non e' rilevata
             if not calibrated:
                 countdown_start_time = None
                 ui_renderer.draw_calibration_popup(frame, 0, warning="Nessun utente rilevato. Posizionati davanti alla fotocamera")
             else:
-                # Ripristina lo stato IDLE in assenza di rilevamento
-                current_state = "CORSA / IDLE"
-                state_frame_count = 0
+                detector.release_vertical()
                 ui_renderer.draw_hud(frame, "NESSUN UTENTE RILEVATO")
- 
-        # Mostra il frame
+
+        cv2.putText(frame, f"{fps:.0f} FPS | inferenza {infer_ms:.0f} ms", (10, height - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.imshow("Subway Surfers Motion Tracker", frame)
- 
-        # Chiusura con tasto ESC (ASCII 27)
+
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
             break
- 
-    # Rilascio risorse
+        if key in (ord('r'), ord('R')):
+            print("[TRACKER] Ricalibrazione richiesta.")
+            calibrated = False
+            calib_y, calib_x, calib_d, calib_hips = [], [], [], []
+            countdown_start_time = None
+
+    reader.stop()
     cap.release()
     cv2.destroyAllWindows()
     pose.close()
     print("Programma terminato pulitamente.")
- 
+
+
 if __name__ == "__main__":
     main()

@@ -7,8 +7,8 @@ class InputSimulator:
     Encapsulates player lane state and action cooldowns.
     """
     # Cooldown constants in seconds
-    COOLDOWN_JUMP = 0.5
-    COOLDOWN_CROUCH = 0.5
+    COOLDOWN_JUMP = 0.25
+    COOLDOWN_CROUCH = 0.25
     COOLDOWN_HOVERBOARD = 3.0
 
     def __init__(self, failsafe=True, pause=0):

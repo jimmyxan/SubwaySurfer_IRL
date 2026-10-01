@@ -152,7 +152,7 @@ def test_input_simulator_cooldowns(mock_time, mock_press):
     mock_press.assert_called_once_with('up')
     mock_press.reset_mock()
     
-    # Time t = 100.2 (cooldown of 0.5 active -> should not press)
+    # Time t = 100.2 (cooldown of 0.25 active -> should not press)
     mock_time.return_value = 100.2
     sim.simulate("CORSA / IDLE", "SALTO")
     mock_press.assert_not_called()
@@ -309,9 +309,70 @@ def test_open_private_browser_linux_fallback(mock_subproc, mock_webbrowser):
         mock_webbrowser.assert_called_once_with("file://index.html")
 
 
+# --- TESTS FOR MOTION_LOGIC ---
+
+from motion_logic import MotionDetector, ClapDetector
 
 
+def run(det, frames, t0=0.0, dt=1 / 30):
+    """frames: lista di (y, x); ritorna la lista di eventi per frame."""
+    out = []
+    for i, (y, x) in enumerate(frames):
+        out.append(det.update(y, x, 0.15, t0 + i * dt))
+    return out
 
 
+def make_detector():
+    det = MotionDetector()
+    det.calibrate(0.5, 0.5, 0.15)
+    return det
 
 
+def test_jump_is_immediate():
+    det = make_detector()
+    events = run(det, [(0.5, 0.5)] * 3 + [(0.38, 0.5)])
+    assert events[3] == ["SALTO"]
+
+
+def test_jump_not_triggered_by_small_noise():
+    det = make_detector()
+    events = run(det, [(0.5 + 0.01 * ((-1) ** i), 0.5) for i in range(30)])
+    assert all(e == [] for e in events)
+
+
+def test_fast_rise_triggers_jump_below_position_threshold():
+    det = make_detector()
+    events = run(det, [(0.5, 0.5)] * 3 + [(0.48, 0.5), (0.45, 0.5), (0.44, 0.5)])
+    assert any("SALTO" in e for e in events)
+
+
+def test_lane_change_with_hysteresis():
+    det = make_detector()
+    left = (0.5, 0.40)
+    events = run(det, [(0.5, 0.5)] * 3 + [left] * 6)
+    flat = [e for ev in events for e in ev]
+    assert flat == ["SPOSTAMENTO SINISTRA"]
+    # Poco dentro la soglia: resta a sinistra (isteresi)
+    events = run(det, [(0.5, 0.445)] * 6, t0=10)
+    assert [e for ev in events for e in ev] == []
+    # Ritorno al centro
+    events = run(det, [(0.5, 0.5)] * 6, t0=20)
+    assert [e for ev in events for e in ev] == ["SPOSTAMENTO CENTRO"]
+
+
+def test_lateral_not_suppressed_by_vertical():
+    det = make_detector()
+    events = run(det, [(0.5, 0.5)] * 3 + [(0.38, 0.40)] * 6)
+    flat = [e for ev in events for e in ev]
+    assert "SALTO" in flat and "SPOSTAMENTO SINISTRA" in flat
+
+
+def test_clap_requires_two_pairs_and_confirmation():
+    clap = ClapDetector()
+    assert clap.update(1, 4) is False       # una sola coppia vicina: no
+    assert clap.update(2, 4) is False       # primo frame valido
+    assert clap.update(2, 4) is True        # confermato
+    assert clap.update(2, 4) is False       # niente retrigger finche' le mani restano unite
+    assert clap.update(0, 4) is False
+    assert clap.update(2, 4) is False
+    assert clap.update(2, 4) is True
