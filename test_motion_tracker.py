@@ -376,3 +376,106 @@ def test_clap_requires_two_pairs_and_confirmation():
     assert clap.update(0, 4) is False
     assert clap.update(2, 4) is False
     assert clap.update(2, 4) is True
+
+
+# --- TESTS: anti-falsi-positivi ---
+
+from motion_logic import landmarks_reliable
+import focus_guard
+
+
+def run_hips(det, frames, t0=0.0, dt=1 / 30):
+    """frames: lista di (shoulder_y, hip_y, x)."""
+    out = []
+    for i, (sy, hy, x) in enumerate(frames):
+        out.append(det.update(sy, x, 0.15, t0 + i * dt, hip_y=hy))
+    return out
+
+
+def flat(events):
+    return [e for ev in events for e in ev]
+
+
+def make_hip_detector():
+    det = MotionDetector()
+    det.calibrate(0.4, 0.5, 0.15, hip_y=0.7)
+    return det
+
+
+def test_no_landing_rebound_crouch_after_jump():
+    det = make_detector()
+    frames = [(0.5, 0.5)] * 3 + [(0.38, 0.5)] * 4 + [(0.5, 0.5)] * 2 + [(0.62, 0.5)] * 6 + [(0.5, 0.5)] * 6
+    assert flat(run(det, frames)) == ["SALTO"]
+
+
+def test_crouch_after_dead_zone_is_detected():
+    det = make_detector()
+    frames = [(0.5, 0.5)] * 3 + [(0.38, 0.5)] * 4 + [(0.5, 0.5)] * 20 + [(0.62, 0.5)] * 6
+    assert flat(run(det, frames)) == ["SALTO", "CAPRIOLA"]
+
+
+def test_gesture_requires_rest_after_wobble():
+    det = make_detector()
+    # Dopo un'oscillazione fuori dalla zona neutra servono 150 ms di riposo prima di un nuovo gesto
+    frames = [(0.5, 0.5)] * 6 + [(0.56, 0.5)] * 12 + [(0.5, 0.5)] * 2 + [(0.62, 0.5)] * 3
+    assert flat(run(det, frames)) == []
+
+
+def test_standing_up_from_lean_is_not_a_fast_jump():
+    det = make_detector()
+    frames = [(0.5, 0.5)] * 3 + [(0.58, 0.5)] * 20 + [(0.5, 0.5)] * 5
+    assert flat(run(det, frames)) == []
+
+
+def test_outlier_landmark_jump_is_ignored():
+    det = make_detector()
+    frames = [(0.5, 0.5)] * 5 + [(0.1, 0.5)] + [(0.5, 0.5)] * 5
+    assert flat(run(det, frames)) == []
+
+
+def test_persistent_move_is_accepted_after_outliers():
+    det = make_detector()
+    frames = [(0.5, 0.5)] * 5 + [(0.3, 0.5)] * 8
+    assert "SALTO" in flat(run(det, frames))
+
+
+def test_jump_requires_hips_to_rise():
+    det = make_hip_detector()
+    # Solo le spalle salgono (stiramento): non e' un salto
+    frames = [(0.4, 0.7, 0.5)] * 3 + [(0.30, 0.7, 0.5)] * 6
+    assert flat(run_hips(det, frames)) == []
+
+
+def test_jump_with_hips_rising_is_detected():
+    det = make_hip_detector()
+    frames = [(0.4, 0.7, 0.5)] * 3 + [(0.33, 0.63, 0.5)] * 3
+    assert "SALTO" in flat(run_hips(det, frames))
+
+
+def test_forward_lean_is_not_crouch_when_hips_available():
+    det = make_hip_detector()
+    # Inclinazione in avanti: spalle +0.15, fianchi fermi -> media +0.075 < soglia 0.10
+    frames = [(0.4, 0.7, 0.5)] * 3 + [(0.55, 0.7, 0.5)] * 6
+    assert flat(run_hips(det, frames)) == []
+
+
+def test_landmarks_reliable():
+    assert landmarks_reliable([0.9, 0.8])
+    assert not landmarks_reliable([0.9, 0.4])
+
+
+def test_is_game_title():
+    assert focus_guard.is_game_title("Subway Surfers - Google Chrome")
+    assert not focus_guard.is_game_title("Subway Surfers Motion Tracker")
+    assert not focus_guard.is_game_title("Terminal")
+
+
+def test_focus_guard_states():
+    titles = iter(["Subway Surfers - Safari", "Terminal", None])
+    g = focus_guard.FocusGuard(title_getter=lambda: next(titles))
+    g.check_now()
+    assert g.focused
+    g.check_now()
+    assert not g.focused
+    g.check_now()   # titolo sconosciuto: permissivo
+    assert g.focused and g.unknown

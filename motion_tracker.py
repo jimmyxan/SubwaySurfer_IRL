@@ -11,8 +11,9 @@ import webbrowser
 import ui_renderer
 from ui_renderer import PoseLandmark
 from input_simulator import InputSimulator
-from motion_logic import (MotionDetector, ClapDetector, JUMP_THRESHOLD, CROUCH_THRESHOLD,
-                          LATERAL_THRESHOLD)
+from motion_logic import (MotionDetector, ClapDetector, landmarks_reliable, MIN_VISIBILITY, JUMP_THRESHOLD,
+                          CROUCH_THRESHOLD, LATERAL_THRESHOLD)
+from focus_guard import FocusGuard
 
 try:
     import mediapipe.python.solutions.pose as mp_pose
@@ -362,10 +363,14 @@ def main():
         print("Errore: Impossibile accedere a nessuna webcam.")
         return
     reader = LatestFrameReader(cap)
+    focus = FocusGuard()
+    focus.start()
+    paused = False
+    was_inactive = False
 
     # Stato di calibrazione
     calibrated = False
-    calib_y, calib_x, calib_d, calib_hips = [], [], [], []
+    calib_y, calib_x, calib_d, calib_hips, calib_hy = [], [], [], [], []
     use_hips_detection = False
     countdown_start_time = None
     game_started = False
@@ -451,16 +456,18 @@ def main():
                         calib_x.append(x_torso)
                         calib_d.append(shoulder_dist)
                         calib_hips.append((left_hip.visibility + right_hip.visibility) / 2)
+                        calib_hy.append((left_hip.y + right_hip.y) / 2)
 
                         progress = int((len(calib_y) / CALIBRATION_FRAMES) * 100)
                         ui_renderer.draw_calibration_popup(frame, progress)
 
                         if len(calib_y) >= CALIBRATION_FRAMES:
                             # Mediana: robusta ai frame rumorosi
+                            use_hips_detection = float(np.mean(calib_hips)) > MIN_VISIBILITY
                             detector.calibrate(float(np.median(calib_y)), float(np.median(calib_x)),
-                                               float(np.median(calib_d)))
+                                               float(np.median(calib_d)),
+                                               hip_y=float(np.median(calib_hy)) if use_hips_detection else None)
                             simulator.corsia_attuale = "CENTRO"
-                            use_hips_detection = float(np.mean(calib_hips)) > 0.5
                             calibrated = True
                             bad_framing_frames = 0
                             print("Calibrazione completata!")
@@ -483,56 +490,80 @@ def main():
 
             # --- RILEVAMENTO MOVIMENTI ---
             else:
-                is_framed, warning_msg = ui_renderer.check_framing(landmarks, use_hips=use_hips_detection)
-
-                if not is_framed:
-                    # Tolleranza: un frame sporadico fuori inquadratura (es. durante un salto) non resetta nulla
-                    bad_framing_frames += 1
-                    if bad_framing_frames > FRAMING_TOLERANCE_FRAMES:
-                        detector.release_vertical()
-                    ui_renderer.draw_hud(frame, detector.display_state)
-                    ui_renderer.draw_warning_overlay(frame, f"INQUADRATURA COMPROMESSA: {warning_msg}")
-                else:
-                    bad_framing_frames = 0
-
-                    # Applauso -> HOVERBOARD (non blocca gli altri movimenti)
-                    hand_pairs = [
-                        (PoseLandmark.LEFT_WRIST, PoseLandmark.RIGHT_WRIST),
-                        (PoseLandmark.LEFT_INDEX, PoseLandmark.RIGHT_INDEX),
-                        (PoseLandmark.LEFT_PINKY, PoseLandmark.RIGHT_PINKY),
-                        (PoseLandmark.LEFT_THUMB, PoseLandmark.RIGHT_THUMB),
-                    ]
-                    max_hand_dist = CLAP_DISTANCE_RATIO * detector.d0
-                    valid = 0
-                    close = 0
-                    for l_idx, r_idx in hand_pairs:
-                        l_pt, r_pt = landmarks[l_idx], landmarks[r_idx]
-                        if l_pt.visibility > 0.5 and r_pt.visibility > 0.5:
-                            valid += 1
-                            if np.hypot(l_pt.x - r_pt.x, l_pt.y - r_pt.y) < max_hand_dist:
-                                close += 1
-                    for idx in (PoseLandmark.LEFT_WRIST, PoseLandmark.RIGHT_WRIST):
-                        pt = landmarks[idx]
-                        cv2.circle(frame, (int(pt.x * width), int(pt.y * height)), 6, (255, 0, 255), -1)
-
-                    if clap.update(close, valid):
-                        hoverboard_until = now + HOVERBOARD_DISPLAY_SECONDS
-                        print("[TRACKER] GESTO RILEVATO: Applauso! Attivazione HOVERBOARD")
-                        simulator.simulate(detector.display_state, "HOVERBOARD")
-
-                    prev_lane = detector.lane
-                    events = detector.update(y_shoulders, x_torso, shoulder_dist, now)
-                    for event in events:
-                        print(f"[TRACKER] Evento: {event}")
-                        simulator.simulate(prev_lane, event)
-
-                    draw_guides(frame, detector, width, height,
-                                min(max(shoulder_dist / detector.d0, 0.5), 2.0))
-
-                    if now < hoverboard_until and detector.is_idle:
-                        ui_renderer.draw_hud(frame, "HOVERBOARD")
+                active = not paused and focus.focused
+                if not active:
+                    # Pausa o finestra di gioco non in focus: nessun tasto inviato
+                    was_inactive = True
+                    clap = ClapDetector()
+                    if paused:
+                        ui_renderer.draw_hud(frame, "IN PAUSA")
                     else:
+                        ui_renderer.draw_hud(frame, "GIOCO NON IN FOCUS")
+                        ui_renderer.draw_warning_overlay(frame, "Clicca sulla finestra del gioco: tasti sospesi")
+                else:
+                    if was_inactive:
+                        # Alla ripresa si riparte dal centro, senza eventi spuri
+                        was_inactive = False
+                        detector.reset_state()
+                        simulator.corsia_attuale = "CENTRO"
+                        bad_framing_frames = 0
+                    is_framed, warning_msg = ui_renderer.check_framing(landmarks, use_hips=use_hips_detection)
+
+                    if not is_framed:
+                        # Tolleranza: un frame sporadico fuori inquadratura (es. durante un salto) non resetta nulla
+                        bad_framing_frames += 1
+                        if bad_framing_frames > FRAMING_TOLERANCE_FRAMES:
+                            detector.release_vertical()
                         ui_renderer.draw_hud(frame, detector.display_state)
+                        ui_renderer.draw_warning_overlay(frame, f"INQUADRATURA COMPROMESSA: {warning_msg}")
+                    else:
+                        bad_framing_frames = 0
+
+                        # Applauso -> HOVERBOARD (non blocca gli altri movimenti)
+                        hand_pairs = [
+                            (PoseLandmark.LEFT_WRIST, PoseLandmark.RIGHT_WRIST),
+                            (PoseLandmark.LEFT_INDEX, PoseLandmark.RIGHT_INDEX),
+                            (PoseLandmark.LEFT_PINKY, PoseLandmark.RIGHT_PINKY),
+                            (PoseLandmark.LEFT_THUMB, PoseLandmark.RIGHT_THUMB),
+                        ]
+                        max_hand_dist = CLAP_DISTANCE_RATIO * detector.d0
+                        valid = 0
+                        close = 0
+                        for l_idx, r_idx in hand_pairs:
+                            l_pt, r_pt = landmarks[l_idx], landmarks[r_idx]
+                            if l_pt.visibility > 0.5 and r_pt.visibility > 0.5:
+                                valid += 1
+                                if np.hypot(l_pt.x - r_pt.x, l_pt.y - r_pt.y) < max_hand_dist:
+                                    close += 1
+                        for idx in (PoseLandmark.LEFT_WRIST, PoseLandmark.RIGHT_WRIST):
+                            pt = landmarks[idx]
+                            cv2.circle(frame, (int(pt.x * width), int(pt.y * height)), 6, (255, 0, 255), -1)
+
+                        if clap.update(close, valid):
+                            hoverboard_until = now + HOVERBOARD_DISPLAY_SECONDS
+                            print("[TRACKER] GESTO RILEVATO: Applauso! Attivazione HOVERBOARD")
+                            simulator.simulate(detector.display_state, "HOVERBOARD")
+
+                        vis = [left_shoulder.visibility, right_shoulder.visibility]
+                        if use_hips_detection:
+                            vis += [left_hip.visibility, right_hip.visibility]
+                        hip_y = (left_hip.y + right_hip.y) / 2 if use_hips_detection else None
+                        prev_lane = detector.lane
+                        if landmarks_reliable(vis):
+                            events = detector.update(y_shoulders, x_torso, shoulder_dist, now, hip_y=hip_y)
+                        else:
+                            events = []  # tracciamento incerto: frame ignorato
+                        for event in events:
+                            print(f"[TRACKER] Evento: {event}")
+                            simulator.simulate(prev_lane, event)
+
+                        draw_guides(frame, detector, width, height,
+                                    min(max(shoulder_dist / detector.d0, 0.5), 2.0))
+
+                        if now < hoverboard_until and detector.is_idle:
+                            ui_renderer.draw_hud(frame, "HOVERBOARD")
+                        else:
+                            ui_renderer.draw_hud(frame, detector.display_state)
         else:
             if not calibrated:
                 countdown_start_time = None
@@ -543,17 +574,23 @@ def main():
 
         cv2.putText(frame, f"{fps:.0f} FPS | inferenza {infer_ms:.0f} ms", (10, height - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, "R ricalibra | P pausa | ESC esci", (10, height - 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
         cv2.imshow("Subway Surfers Motion Tracker", frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
             break
+        if key in (ord('p'), ord('P')):
+            paused = not paused
+            print(f"[TRACKER] {'PAUSA: tasti sospesi' if paused else 'Ripresa'}")
         if key in (ord('r'), ord('R')):
             print("[TRACKER] Ricalibrazione richiesta.")
             calibrated = False
-            calib_y, calib_x, calib_d, calib_hips = [], [], [], []
+            calib_y, calib_x, calib_d, calib_hips, calib_hy = [], [], [], [], []
             countdown_start_time = None
 
+    focus.stop()
     reader.stop()
     cap.release()
     cv2.destroyAllWindows()
